@@ -1,6 +1,6 @@
 import numpy as np
 from scipy.stats import poisson
-from glmpy.core.models.base_glm import BaseGLM
+from glmpy.models.base_glm import BaseGLM
 import torch
 
 class PoissonModel(BaseGLM):
@@ -9,47 +9,57 @@ class PoissonModel(BaseGLM):
         self.has_mle = True
 
     def get_initial_params(self):
+        epsilon = 1e-6
         y_numpy = self.y.detach().numpy()
         X_numpy = self.X.detach().numpy()
-        
+
         num_betas = X_numpy.shape[1]
+
+        theoretical_mus = np.array(
+            [
+                np.log(np.mean(y_numpy[X_numpy[:, i] != 0]) + epsilon)
+                if np.any(X_numpy[:, i] != 0) else np.log(epsilon)
+                for i in range(num_betas)
+            ]
+        )
         
-        theoretical_means = np.array([
-            np.log(np.mean(y_numpy[X_numpy[:, i] != 0]) + 1e-4)
-            for i in range(num_betas)
-        ])
-            
+        # theoretical_mus = np.nan_to_num(theoretical_mus, nan=np.log(epsilon))
+
         # Define the scaling factor for sigma
         scaling_factor = 0.1  # for example, 1% of the mean
-        
+
         # Generate initial params with scaled sigma
         initial_params = [
-            [np.random.normal(loc=theoretical_means[i], scale=abs(scaling_factor * theoretical_means[i])) for i in range(num_betas)]
+            [np.random.normal(loc=theoretical_mus[i], scale=abs(scaling_factor * theoretical_mus[i])) for i in range(num_betas)]
             for _ in range(5)
-        ] + [theoretical_means.tolist()]
-                
+        ] + [theoretical_mus.tolist()]
+
         return initial_params
 
     def loglik(self, params, params_tensor = None, ret_torch=True):
-        beta = params if params_tensor is None else params_tensor
-        if isinstance(beta, np.ndarray):
-            beta = torch.tensor(params).reshape(-1, 1)
+        params = params if params_tensor is None else params_tensor
+        
+        if not isinstance(params, torch.Tensor):
+            params = torch.tensor(params).reshape(-1, 1)
+            
+        beta = params
+        mu = torch.matmul(self.X[:, 1:], torch.exp(beta[1:]))
 
-        mu = torch.matmul(self.X, torch.exp(beta))
-
-        loglikelihood = torch.distributions.Poisson(mu).log_prob(self.y).sum()
+        # Calculate the log-likelihood
+        ll = torch.distributions.Poisson(mu).log_prob(self.y).sum()
 
         if ret_torch:
-            return -loglikelihood * self.scale_factor
+            return self.scale_factor * -ll
 
-        return -loglikelihood.detach() * self.scale_factor
+        return self.scale_factor * -ll.detach()
     
     def estimate_with_mle(self):
         y_numpy = self.y.detach().numpy()
         X_numpy = self.X.detach().numpy()
         num_betas = X_numpy.shape[1]
+        
         return np.array([
-            np.log(np.mean(y_numpy[X_numpy[:, i] != 0]) + 1e-4)
+            np.log(np.mean(y_numpy[X_numpy[:, i] != 0]) + 1e-4) if np.any(X_numpy[:, i] != 0) else 1e-6
             for i in range(num_betas)
         ])
         
@@ -84,14 +94,15 @@ class PoissonModel(BaseGLM):
         Returns:
         - samples: array of Poisson-distributed samples.
         """
-        covariate_list = ['!Intercept'] + sorted(covariate_list)
-        covariate_index = covariate_list.index(covariate)
+        covariate_list = sorted(covariate_list)
+        covariate_index = covariate_list.index(covariate) + 1
         
         dm = design_matrix[:, [0, covariate_index]]
         
+        dm = dm[dm[:, 1] != 0]
         
-        betas = [params[0], params[covariate_index]]
-        mu = np.dot(dm, np.exp(betas))
+        betas = [0, params[covariate_index]]
+        mu = BaseGLM._get_linear_estimator(betas, size, num_covariates=len(betas), design_matrix=dm)
         samples = np.random.poisson(mu, size=size)
         return samples
 

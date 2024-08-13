@@ -8,11 +8,13 @@ from loguru import logger
 
 from icecream import install
 from icecream import ic
+
 install()
 ic.configureOutput(includeContext=False)
 
 
-from glmpy.core import (
+from glmpy.models import (
+    BaseGLM,
     PoissonModel,
     NBModel,
     ZIPModel,
@@ -21,6 +23,7 @@ from glmpy.core import (
 
 
 __all__ = [
+    "BaseGLM",
     "PoissonModel",
     "NBModel",
     "ZIPModel",

@@ -8,7 +8,7 @@ from icecream import ic
 from scipy.special import expit, logit
 from scipy.stats import nbinom, truncnorm
 
-from glmpy.core.models.base_glm import BaseGLM
+from glmpy.models.base_glm import BaseGLM
 
 class ZINBModel(BaseGLM):
     def __init__(self, y, **kwargs):
@@ -16,58 +16,103 @@ class ZINBModel(BaseGLM):
         self.has_mle = False
 
     def get_initial_params(self):
+        epsilon = 1e-4
         y_numpy = self.y.detach().numpy()
         X_numpy = self.X.detach().numpy()
 
         num_betas = X_numpy.shape[1]
-
+        
         theoretical_pi = len(y_numpy[y_numpy == 0]) / len(y_numpy)
-        theoretical_pi = max(min(theoretical_pi, 0.999), 0.001)
+        theoretical_pi = max(min(theoretical_pi, 0.99), 0.01)
         theoretical_p0 = logit(theoretical_pi)
 
         scaling_factor = 0.1
         num_initial_samples = 6
+        
+        # ic(theoretical_p0)
 
         # First set of theoretical mus
         theoretical_mus = np.array(
             [
-                np.log(np.mean(y_numpy[X_numpy[:, i] != 0]) + 1e-4)
+                np.log(np.mean(y_numpy[X_numpy[:, i] != 0]) + epsilon)
+                if np.any(X_numpy[:, i] != 0) else np.log(epsilon)
                 for i in range(num_betas)
             ]
         )
+        # ic(theoretical_mus)
 
         # Second set of theoretical mus excluding zeros
         theoretical_mus_nonzero = np.array(
             [
-                np.log(np.mean(y_numpy[(X_numpy[:, i] != 0) & (y_numpy != 0)]) + 1e-4)
+                np.log(np.mean(y_numpy[(X_numpy[:, i] != 0) & (y_numpy != 0)]) + epsilon)
+                if np.any(X_numpy[:, i] != 0) else np.log(epsilon)
                 for i in range(num_betas)
             ]
         )
+        
+        # ic(theoretical_mus_nonzero)
+
+        # Determine the length of the linspace arrays
+        max_len = num_initial_samples * 2 - 2  # Since [1:-1] removes the first and last elements
 
         # Generate evenly spaced values between mus and mus_nonzero
         theoretical_mus_spaced = np.array(
-            [np.linspace(theoretical_mus[i], theoretical_mus_nonzero[i], num_initial_samples + 2)[1:-1]
-             for i in range(num_betas)]
+            [
+                np.linspace(theoretical_mus[i], theoretical_mus_nonzero[i], num_initial_samples * 2)[1:-1]
+                if np.any(X_numpy[:, i] != 0) else np.full(max_len, epsilon)
+                for i in range(num_betas)
+            ]
         ).T
+        
+        # ic(theoretical_mus_spaced)
 
+        # Theoretical alphas based on theoretical_mus
         theoretical_alphas = np.array(
             [
-                (np.exp(theoretical_mus[i]) ** 2)
-                / (np.var(y_numpy[X_numpy[:, i] != 0]) - np.exp(theoretical_mus[i]))
+                np.exp(theoretical_mus[i]) ** 2 / (np.var(y_numpy[X_numpy[:, i] != 0]) - np.exp(theoretical_mus[i]))
+                if np.any(X_numpy[:, i] != 0)
+                else 1e-6
+                if np.var(y_numpy[X_numpy[:, i] != 0]) <= np.exp(theoretical_mus[i])
+                else 1e6  # Large value for non-overdispersed data
+                for i in range(num_betas)
+            ]
+        )
+        
+        # ic(theoretical_alphas)
+
+        # Theoretical alphas based on theoretical_mus_nonzero
+        theoretical_alphas_nonzero = np.array(
+            [
+                (np.exp(theoretical_mus_nonzero[i]) ** 2) / (np.var(y_numpy[(X_numpy[:, i] != 0) & (y_numpy != 0)]) - np.exp(theoretical_mus_nonzero[i]))
+                if np.any((X_numpy[:, i] != 0) & (y_numpy != 0)) and np.var(y_numpy[(X_numpy[:, i] != 0) & (y_numpy != 0)]) > np.exp(theoretical_mus_nonzero[i])
+                else epsilon
+                if not np.any((X_numpy[:, i] != 0))
+                else 1e6
+                if np.var(y_numpy[(X_numpy[:, i] != 0) & (y_numpy != 0)]) <= np.exp(theoretical_mus_nonzero[i])
+                else epsilon
                 for i in range(num_betas)
             ]
         )
 
-        initial_mus = [
+        # ic(theoretical_alphas_nonzero)
+        
+        # Theoretical alphas based on theoretical_mus_spaced
+        theoretical_alphas_spaced = np.array(
             [
-                np.random.normal(
-                    loc=theoretical_mus[i],
-                    scale=abs(scaling_factor * theoretical_mus[i]),
-                )
+                [
+                    (np.exp(spaced_mu) ** 2) / (np.var(y_numpy[X_numpy[:, i] != 0]) - np.exp(spaced_mu))
+                    if np.any(X_numpy[:, i] != 0) and np.var(y_numpy[X_numpy[:, i] != 0]) > np.exp(spaced_mu)
+                    else epsilon
+                    if not np.any(X_numpy[:, i] != 0)
+                    else 1e6
+                    if np.var(y_numpy[X_numpy[:, i] != 0]) <= np.exp(spaced_mu)
+                    else epsilon
+                    for spaced_mu in theoretical_mus_spaced[:, i]
+                ]
                 for i in range(num_betas)
             ]
-            for _ in range(num_initial_samples)
-        ] + [theoretical_mus.tolist()]
+        ).T
+        # ic(theoretical_alphas_spaced)
 
         initial_mus_nonzero = [
             [
@@ -80,21 +125,19 @@ class ZINBModel(BaseGLM):
             for _ in range(num_initial_samples)
         ] + [theoretical_mus_nonzero.tolist()]
 
-        initial_mus_spaced = [
-            spaced.tolist()
-            for spaced in theoretical_mus_spaced
-        ]
 
-        initial_alphas = [
+
+        initial_alphas_nonzero = [
             [
                 np.random.normal(
-                    loc=theoretical_alphas[i],
-                    scale=abs(scaling_factor * theoretical_alphas[i]),
+                    loc=theoretical_alphas_nonzero[i],
+                    scale=abs(scaling_factor * theoretical_alphas_nonzero[i]),
                 )
                 for i in range(num_betas)
             ]
-            for _ in range(num_initial_samples * 3 - 1)
-        ] + [theoretical_alphas.tolist()]
+            for _ in range(num_initial_samples)
+        ] + [theoretical_alphas_nonzero.tolist()]
+
 
         initial_p0s = [
             [
@@ -106,53 +149,60 @@ class ZINBModel(BaseGLM):
         ] + [[theoretical_p0]]
 
         initial_params = [
-            initial_mus[i] + initial_p0s[i] + initial_alphas[i] for i in range(num_initial_samples)
+            np.hstack((np.nan_to_num(initial_mus_nonzero[i], nan = -6), initial_p0s[i], initial_alphas_nonzero[i])) for i in range(num_initial_samples)
         ]
 
-        initial_params += [
-            initial_mus_nonzero[i - num_initial_samples] + initial_p0s[i] + initial_alphas[i] for i in range(num_initial_samples, num_initial_samples * 2)
-        ]
-
-        initial_params += [
-            initial_mus_spaced[i - num_initial_samples * 2] + initial_p0s[i] + initial_alphas[i] for i in range(num_initial_samples * 2, num_initial_samples * 3)
-        ]
+        # ic(initial_params)
 
         return initial_params
+
 
     def loglik(self, params, params_tensor=None, ret_torch=True):
         if params_tensor is not None:
             params = params_tensor
+            
+        # ic(params)
+            
+        if not isinstance(params, torch.Tensor):
+            params = torch.tensor(params).reshape(-1, 1)
 
         num_betas = self.X.shape[1]
         beta = params[:num_betas]
 
-        p0 = torch.sigmoid(params[num_betas])
-        alpha = params[num_betas + 1:]
+        p0 = params[num_betas]
 
+        pi = torch.sigmoid(params[num_betas])
+        alpha = params[num_betas + 1:]
         
-        mu = torch.matmul(self.X, torch.exp(beta))
-        sigma = torch.matmul(self.X, alpha)
+        mu = torch.matmul(self.X[:, 1:], torch.exp(beta[1:]))
+        sigma = torch.matmul(self.X[:, 1:], alpha[1:])
 
         r = sigma
-        r = torch.clamp(sigma, min=1e-7, max=1 - 1e-7)
-        p = torch.clamp(r / (r + mu), min=1e-7, max=1 - 1e-7)
+        epsilon = 1e-6
+        r = torch.nan_to_num(r, nan = epsilon)
+        r = torch.clamp(r, min=epsilon, max=1e5)
+        r[r < epsilon] = epsilon
 
+        p = sigma / (sigma + mu)
+
+        p = torch.nan_to_num(p, nan = epsilon)
+        p = torch.clamp(p, epsilon, 1 - epsilon)
+    
         pmf_zero = torch.distributions.NegativeBinomial(
             total_count=r, probs=p
         ).log_prob(torch.zeros_like(self.y))
         
+        
         pmf_y = torch.distributions.NegativeBinomial(total_count=r, probs=p).log_prob(
             self.y
         )
-        
-        pmf_zero = torch.clamp(pmf_zero, min=1e-10)
-        pmf_y = torch.clamp(pmf_y, min=1e-10)
 
         ll = torch.where(
             self.y == 0,
-            torch.log(p0 + (1 - p0) * pmf_zero),
-            torch.log((1 - p0) * pmf_y),
-        ).sum()
+            torch.logaddexp(torch.log(pi), torch.log1p(-pi) + pmf_zero),
+            torch.log1p(-pi) + pmf_y
+        ).sum()       
+
         if ret_torch:
             return self.scale_factor * -ll
         return self.scale_factor * -ll.detach()
@@ -181,18 +231,22 @@ class ZINBModel(BaseGLM):
         alphas = params[num_betas + 1:]
 
         mu = BaseGLM._get_linear_estimator(betas, size, num_covariates=len(betas), design_matrix=design_matrix)
-        alpha = BaseGLM._get_linear_estimator(alphas, size, num_covariates=len(alphas), design_matrix=design_matrix)
-        
-        r = alpha
-        r = np.clip(r, 1e-7, 1 - 1e-7)
+        sigma = BaseGLM._get_linear_estimator(alphas, size, num_covariates=len(alphas), design_matrix=design_matrix)
 
-        p = r / (r + mu)
-        p = np.clip(p, 1e-7, 1 - 1e-7)
+        r = sigma
+        epsilon = 1e-8
+        r = np.nan_to_num(r, nan = epsilon)
+        r = np.clip(r, epsilon, 1e6)
+        r[r < epsilon] = epsilon
+
+        p = sigma / (sigma + mu)
+
+        p = np.nan_to_num(p, nan = epsilon)
+        p = np.clip(p, epsilon, 1 - epsilon)
 
         # Calculate zero-inflation probability
-        pi = expit(p0)
-
-        # Draw samples from the ZINB distribution
+        pi = expit(p0)        
+        
         nb_samples = nbinom.rvs(r, p, size=size)
         zero_inflated = np.random.binomial(1, pi, size=size)
 
@@ -214,28 +268,39 @@ class ZINBModel(BaseGLM):
         Returns:
         - samples: array of Poisson-distributed samples.
         """
-        covariate_list = ['!Intercept'] + sorted(covariate_list)
-        covariate_index = covariate_list.index(covariate)
+        covariate_list = sorted(covariate_list)
+        covariate_index = covariate_list.index(covariate) + 1
         
-        dm = design_matrix[:, [0, covariate_index]]
+        # dm = design_matrix[:, [0, covariate_index]]
+        # dm = dm[dm[:, 1] != 0]
         
         num_betas = len(params) // 2
         
-        betas = [params[0], params[covariate_index]]
+        # betas = [0, params[covariate_index]]
         p0 = params[num_betas]
-        alphas = [params[num_betas + 1], params[num_betas + covariate_index + 1]]
+        # alphas = [params[0], params[num_betas + covariate_index + 1]]
         
-        mu = np.dot(dm, np.exp(betas))
-        alpha = np.dot(dm, alphas)
+        # mu = BaseGLM._get_linear_estimator(betas, size, num_covariates=len(betas), design_matrix=dm)
+        # sigma = BaseGLM._get_linear_estimator(alphas, size, num_covariates=len(alphas), design_matrix=dm)
         
-        r = alpha
-        r = np.clip(r, 1e-7, 1 - 1e-7)
-
-        p = r / (r + mu)
-        p = np.clip(p, 1e-7, 1 - 1e-7)
+        # r = sigma
+        # p = r / (r + mu)
+        
+        # ic(r)
+        # ic(p)
         
         pi = expit(p0)
+        
+        epsilon = 1e-8
+        
+        r = params[num_betas + covariate_index]
+        r = np.nan_to_num(r, nan = epsilon)
+        r = np.clip(r, epsilon, 1e6)
+        p = r / (r + np.exp(params[covariate_index]))
+        p = np.nan_to_num(p, nan = epsilon)
+        p = np.clip(p, epsilon, 1 - epsilon)
 
+        
         nb_samples = nbinom.rvs(r, p, size=size)
         zero_inflated = np.random.binomial(1, pi, size=size)
         

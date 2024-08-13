@@ -13,6 +13,7 @@ from numpy.typing import ArrayLike
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from scipy.optimize import OptimizeResult, minimize
 from scipy.stats import chi2
+from icecream import ic
 
 
 class BaseGLM(BaseModel):
@@ -24,7 +25,7 @@ class BaseGLM(BaseModel):
         X (Optional[np.ndarray]): Feature matrix.
         name (Optional[str]): Model name.
         covariates (Optional[dict]): Dictionary of covariates.
-        covariate_names (list): List of covariate names.
+        covariate_names (dict): List of covariate names.
         best_fit_res (Optional[OptimizeResult]): Result of the best fit.
         best_params (Optional[np.ndarray]): Best fit parameters.
         best_loglik (float): Best log-likelihood value.
@@ -42,7 +43,7 @@ class BaseGLM(BaseModel):
     name: Optional[str] = Field(default=None)
 
     covariates: Optional[dict] = Field(default_factory=dict)
-    covariate_names: list = Field(default=["!Intercept"])
+    covariate_names: dict = Field(default_factory=dict)
 
     best_fit_res: OptimizeResult = Field(default=None)
     best_params: list = Field(default=None)
@@ -116,32 +117,50 @@ class BaseGLM(BaseModel):
         """
         Post-initialization process to set up the model.
         """
-        
+
         os.environ["PYTENSOR_FLAGS"] = "optimizer_excluding=constant_folding"
 
         covariate_dummies_list = []
         num_dummy_counts = ceil(0.01 * len(self.y))
+            
+        # Create a DataFrame with all covariate names initialized to zeros
+        all_covariate_dummies = pd.DataFrame(index=range(len(self.y)))
+        
+        if not self.covariate_names:
+            self.covariate_names = {k : set(v) for k, v in self.covariates.items()}
 
         if self.covariates:
-            for covariate_name, covariate_data in self.covariates.items():
+            for covariate_type, covariate_data in self.covariates.items():
                 covariate_dummies = pd.get_dummies(
-                    pd.DataFrame(
-                        self.covariates[covariate_name], columns=[covariate_name]
-                    ),
+                    pd.DataFrame(covariate_data, columns=[covariate_type]),
                     drop_first=False,
                 ).astype(float)
 
                 if covariate_dummies is not None:
-                    self.covariate_names += covariate_dummies.columns.tolist()
                     covariate_dummies_list.append(covariate_dummies)
 
-        self.covariate_names = sorted(list(set(self.covariate_names)))
-        
+
+        # Ensure all covariate names are present
+        self.covariate_names = {k: sorted(list(set([str(i) for i in v]))) for k, v in self.covariate_names.items()}
+
+        for covariate_type, dummy_columns in self.covariate_names.items():
+            for column in dummy_columns:
+                column_name = f"{covariate_type}_{column}"
+                if column_name not in all_covariate_dummies.columns:
+                    all_covariate_dummies[column_name] = 0
+
+        # Update the all_covariate_dummies with the actual dummies
+        for dummies in covariate_dummies_list:
+            for column in dummies.columns:
+                all_covariate_dummies[column] = dummies[column]
+                
+
         if self.X is None:
-            self.X = self._stack_arrays(covariate_dummies_list)
+            self.X = all_covariate_dummies
             self.X = sm.add_constant(self.X)
             self.X = torch.tensor(self.X.values, dtype=torch.float64)
-        
+            
+
         self.initial_params_list = self.get_initial_params()
         if not self.initial_params_list:
             raise ValueError("initial_params_list cannot be empty")
@@ -166,6 +185,34 @@ class BaseGLM(BaseModel):
             if arrays and arrays[0] is not None
             else None
         )
+        
+    def find_optimal_scale_factor(self, params_init, max_iter=100, tol=1e-4):
+        scale_factor = self.scale_factor
+        for i in range(max_iter):
+            params_tensor = torch.tensor(params_init, dtype=torch.float64, requires_grad=True)
+            
+            # Compute gradients and Hessians
+            try:
+                grad = self.gradient(params_tensor)
+                hess = self.hessian(params_tensor)
+            except ValueError:
+                scale_factor /= 10
+                continue
+            
+            grad_range = grad.abs().max().item()
+            hess_range = hess.abs().max().item()
+            
+            # Check if the current scale factor is appropriate
+            if grad_range > 1e2 or hess_range > 1e2:
+                scale_factor /= 10
+            elif grad_range < tol or hess_range < tol:
+                scale_factor *= 10
+            else:
+                break
+
+            self.scale_factor = scale_factor
+
+        return scale_factor
         
     def estimate_with_mle(self):
         """
@@ -225,8 +272,10 @@ class BaseGLM(BaseModel):
         log_likelihood = self.loglik(params, ret_torch=True)
         log_likelihood.backward()
         grad = params.grad
+        ic(grad)
+        grad = torch.nan_to_num(grad, nan=1e-6)
         return grad.detach() * self.scale_factor
-
+    
     def hessian(self, params, params_tensor=None, regularization_params=None):
         """
         Calculates the Hessian matrix of the log-likelihood.
@@ -239,14 +288,19 @@ class BaseGLM(BaseModel):
             Hessian matrix.
         """
         params = params if params_tensor is None else params_tensor
+
+        # Calculate the Hessian matrix
         hessian_matrix = torch.autograd.functional.hessian(self.loglik, params)
+        hessian_matrix = torch.nan_to_num(hessian_matrix, nan=0.0) 
 
+        # Apply regularization if provided
         if regularization_params:
-            hessian_matrix = self._apply_regularization(
-                hessian_matrix, regularization_params
-            )
+            hessian_matrix = self._apply_regularization(hessian_matrix, regularization_params)
+        
+        # ic(hessian_matrix)
 
-        return hessian_matrix.detach() * (self.scale_factor**2)
+        return hessian_matrix * (self.scale_factor**2)
+
 
     def _apply_regularization(self, hessian_matrix, regularization_params):
         """
@@ -317,9 +371,13 @@ class BaseGLM(BaseModel):
         """
         if not np.all(np.isfinite(params_init)):
             print(f"Invalid initial parameters: {params_init}")
+            raise ValueError("Invalid initial parameters")
             return None, np.inf, False, "Invalid initial parameters"
+        
+        self.find_optimal_scale_factor(params_init)
 
         params_tensor = torch.tensor(params_init, dtype=torch.float64, requires_grad=True)
+
         gradient_fn = lambda params, *args: self.gradient(params, params_tensor=params_tensor)
         hessian_fn = (
             lambda params, *args: self.hessian(params, params_tensor=params_tensor, regularization_params=regularization_params)
@@ -339,7 +397,8 @@ class BaseGLM(BaseModel):
             )
             if verbose:
                 print(result)
-            return result.x, result.fun, result.success, result.message
+
+            return result.x, result.fun, result.success, result.message, result
         except ValueError as e:
             if safe:
                 print(f"Optimization error with params {params_init}: {e}")
@@ -434,12 +493,6 @@ class BaseGLM(BaseModel):
         """
         start_time = time.time()
         
-        if self.has_mle:
-            self.best_params = self.estimate_with_mle()
-            self.best_loglik = self.loglik(self.best_params)
-            self.best_initialization = "MLE"
-            self.best_fit_res = "MLE"
-            
         if parallel:
             self._parallel_optimization(
                 optimization_method, verbose, regularization_params, minimize_options
@@ -452,10 +505,12 @@ class BaseGLM(BaseModel):
         if self.best_params is None:
             raise ValueError("No initialization converged")
 
-        num_betas = len(self.covariate_names) + 1
-        params_est_beta = self.best_params[: num_betas + 1]
-        self.mu_param_dict = dict(zip(self.covariate_names, params_est_beta.tolist()))
+        num_betas = self.X.shape[1]
+        params_est_beta = self.best_params[: num_betas]
 
+        self.mu_param_dict = {k : dict(zip(['!Intercept'] + v, params_est_beta.tolist())) for k, v in self.covariate_names.items()}
+        
+        
         if ret_time:
             return (
                 self.best_params,
@@ -463,7 +518,7 @@ class BaseGLM(BaseModel):
                 self.best_initialization,
                 time.time() - start_time,
             )
-
+            
         return self.best_params, self.best_loglik, self.best_initialization
 
     def _update_best_fit(self, res, i):
@@ -474,12 +529,12 @@ class BaseGLM(BaseModel):
             res: Result of the optimization.
             i: Index of the initial parameters.
         """
-        params_new, loglik_new, success, message = res
+        params_new, loglik_new, success, message, best_fit_res = res
         if loglik_new < self.best_loglik:
             self.best_loglik = loglik_new
             self.best_params = params_new
             self.best_initialization = self.initial_params_list[i]
-            self.best_fit_res = res
+            self.best_fit_res = best_fit_res
             
     @staticmethod
     def _get_linear_estimator(params, size, num_covariates, design_matrix=None):
@@ -495,7 +550,7 @@ class BaseGLM(BaseModel):
         Returns:
         - eta: array, linear predictor.
         """
-        betas_with_intercept = params[:num_covariates]
+        betas = params[1:num_covariates]
 
         if design_matrix is None:
             design_matrix = np.zeros((size, num_covariates))
@@ -507,12 +562,15 @@ class BaseGLM(BaseModel):
                 end_idx = i * (size // num_covariates)
                 design_matrix[start_idx:end_idx, i] = 1
         elif design_matrix.shape[0] != size:
+            if design_matrix.shape[0] == 0:
+                return np.ones(size) * 1e-6
             # Ensure the proportions are exactly the same
             repeats = size // design_matrix.shape[0]
             remainder = size % design_matrix.shape[0]
             design_matrix = np.vstack([design_matrix] * repeats + [design_matrix[:remainder]])
+            
 
-        eta = np.dot(design_matrix, np.exp(betas_with_intercept))
+        eta = np.dot(design_matrix[:, 1:], np.exp(betas))
         return eta
 
     def empirical_bayes_inference(self, fixed_sigma=1.0, num_samples=500, tune=1000):

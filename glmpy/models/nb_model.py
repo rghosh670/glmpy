@@ -1,6 +1,6 @@
 import numpy as np
 from scipy.stats import nbinom, truncnorm
-from glmpy.core.models.base_glm import BaseGLM
+from glmpy.models.base_glm import BaseGLM
 import torch
 
 
@@ -10,31 +10,44 @@ class NBModel(BaseGLM):
         self.has_mle = True
         
     def get_initial_params(self):
+        epsilon = 1e-10
         y_numpy = self.y.detach().numpy()
         X_numpy = self.X.detach().numpy()
         num_betas = X_numpy.shape[1]
-        
+
         scaling_factor = 0.1
-        theoretical_mus = np.array([
-            np.log(np.mean(y_numpy[X_numpy[:, i] != 0]) + 1e-4)
-            for i in range(num_betas)
-        ])
-        
-        theoretical_alphas = np.array([
-            (np.exp(theoretical_mus[i]) ** 2) / (np.var(y_numpy[X_numpy[:, i] != 0]) - np.exp(theoretical_mus[i]))
-            for i in range(num_betas)
-        ])
-        
+        theoretical_mus = np.array(
+            [
+                np.log(np.mean(y_numpy[X_numpy[:, i] != 0]) + epsilon)
+                if np.any(X_numpy[:, i] != 0) else np.log(epsilon)
+                for i in range(num_betas)
+            ]
+        )
+        # theoretical_mus = np.nan_to_num(theoretical_mus, nan=epsilon)
+
+
+        theoretical_alphas = np.array(
+            [
+                np.exp(theoretical_mus[i]) ** 2 / (np.var(y_numpy[X_numpy[:, i] != 0]) - np.exp(theoretical_mus[i])) 
+                if np.any(X_numpy[:, i] != 0)
+                else 1e-6
+                if np.var(y_numpy[X_numpy[:, i] != 0]) <= np.exp(theoretical_mus[i])
+                else 1e6  # Large value for non-overdispersed data
+                for i in range(num_betas)
+            ]
+        )
+        # theoretical_alphas = np.nan_to_num(theoretical_alphas, nan=epsilon)
+
         initial_mus = [
             [np.random.normal(loc=theoretical_mus[i], scale=abs(scaling_factor * theoretical_mus[i])) for i in range(num_betas)]
             for _ in range(5)
         ] + [theoretical_mus.tolist()]
-        
+
         initial_alphas = [
             [np.random.normal(loc=theoretical_alphas[i], scale=abs(scaling_factor * theoretical_alphas[i])) for i in range(num_betas)]
             for _ in range(5)
         ] + [theoretical_alphas.tolist()]
-        
+
         initial_params = [
             initial_mus[i] + initial_alphas[i]
             for i in range(6)
@@ -46,47 +59,33 @@ class NBModel(BaseGLM):
         if params_tensor is not None:
             params = params_tensor
             
-        if isinstance(params, np.ndarray):
+        if not isinstance(params, torch.Tensor):
             params = torch.tensor(params).reshape(-1, 1)
 
         num_betas = self.X.shape[1]
         beta = params[:num_betas]
         alpha = params[num_betas:]  # Dispersion parameter
 
-        mu = torch.matmul(self.X, torch.exp(beta))
-        sigma = torch.matmul(self.X, alpha)
+        mu = torch.matmul(self.X[:, 1:], torch.exp(beta[1:]))
+        sigma = torch.matmul(self.X[:, 1:], alpha[1:])
 
         r = sigma
-        r = torch.clamp(sigma, min=1e-7, max=1 - 1e-7)
-        p = torch.clamp(r / (r + mu), min=1e-7, max=1 - 1e-7)
+        epsilon = 1e-6
+        r = torch.nan_to_num(r, nan = epsilon)
+        r = torch.clamp(r, min=epsilon, max=1e5)
+        r[r < epsilon] = epsilon
 
-        pmf = torch.distributions.NegativeBinomial(total_count=r, probs=p)
-        log_pmf = pmf.log_prob(self.y)
+        p = sigma / (sigma + mu)
 
-        # Clamp log_pmf to avoid extremely small values
-        log_pmf = torch.clamp(log_pmf, min=-1e10)
-        ll = log_pmf.sum()
+        p = torch.nan_to_num(p, nan = epsilon)
+        p = torch.clamp(p, epsilon, 1 - epsilon)
+
+        ll = torch.distributions.NegativeBinomial(total_count=r, probs=p).log_prob(self.y).sum()
 
         if ret_torch:
-            return -self.scale_factor * -ll
-        return -self.scale_factor * -ll.detach()
+            return self.scale_factor * -ll
+        return self.scale_factor * -ll.detach()
     
-    def estimate_with_mle(self):
-        y_numpy = self.y.detach().numpy()
-        X_numpy = self.X.detach().numpy()
-        num_betas = X_numpy.shape[1]
-    
-        theoretical_mus = np.array([
-            np.log(np.mean(y_numpy[X_numpy[:, i] != 0]) + 1e-4)
-            for i in range(num_betas)
-        ])
-        
-        theoretical_alphas = np.array([
-            (np.exp(theoretical_mus[i]) ** 2) / (np.var(y_numpy[X_numpy[:, i] != 0]) - np.exp(theoretical_mus[i]))
-            for i in range(num_betas)
-        ])
-    
-        return np.append(theoretical_mus, theoretical_alphas)
         
     @staticmethod
     def sample(params, size=10000, design_matrix=None):
@@ -96,18 +95,22 @@ class NBModel(BaseGLM):
         alphas = params[num_betas:]
         
         mu = BaseGLM._get_linear_estimator(betas, size, num_covariates=len(betas), design_matrix=design_matrix)
-        alpha = BaseGLM._get_linear_estimator(alphas, size, num_covariates=len(alphas), design_matrix=design_matrix)
+        sigma = BaseGLM._get_linear_estimator(alphas, size, num_covariates=len(alphas), design_matrix=design_matrix)
 
-        # Calculate parameters for the Negative Binomial distribution
-        r = alpha
-        r = np.clip(r, 1e-7, 1 - 1e-7)
+        r = sigma
+        epsilon = 1e-8
+        r = np.nan_to_num(r, nan = epsilon)
+        r = np.clip(r, epsilon, 1e6)
+        r[r < epsilon] = epsilon
 
-        p = r / (r + mu)
-        p = np.clip(p, 1e-7, 1 - 1e-7)
+        p = sigma / (sigma + mu)
 
-        # Sampling from Negative Binomial distribution using scipy
-        nbinom_samples = nbinom.rvs(r, p, size=size)
-        return nbinom_samples
+        p = np.nan_to_num(p, nan = epsilon)
+        p = np.clip(p, epsilon, 1 - epsilon)
+        
+        samples = nbinom.rvs(r, p, size=size)
+            
+        return samples
     
     @staticmethod
     def sample_from_covariate(params, covariate, covariate_list, size=10000, design_matrix=None):
@@ -122,29 +125,23 @@ class NBModel(BaseGLM):
         Returns:
         - samples: array of Poisson-distributed samples.
         """
-        covariate_list = ['!Intercept'] + sorted(covariate_list)
-        covariate_index = covariate_list.index(covariate)
-        
-        dm = design_matrix[:, [0, covariate_index]]
+        covariate_list = sorted(covariate_list)
+        covariate_index = covariate_list.index(covariate) + 1
         
         num_betas = len(params) // 2
-        
-        betas = [params[0], params[covariate_index]]
-        alphas = [params[num_betas], params[num_betas + covariate_index]]
-        
-        mu = np.dot(dm, np.exp(betas))
-        alpha = np.dot(dm, alphas)
-        
-        r = alpha
-        r = np.clip(r, 1e-7, 1 - 1e-7)
 
-        p = r / (r + mu)
-        p = np.clip(p, 1e-7, 1 - 1e-7)
-
-        # Sampling from Negative Binomial distribution using scipy
-        nbinom_samples = nbinom.rvs(r, p, size=size)
+        epsilon = 1e-8
         
-        return nbinom_samples
+        r = params[num_betas + covariate_index]
+        r = np.nan_to_num(r, nan = epsilon)
+        r = np.clip(r, epsilon, 1e6)
+        p = r / (r + np.exp(params[covariate_index]))
+        p = np.nan_to_num(p, nan = epsilon)
+        p = np.clip(p, epsilon, 1 - epsilon)
+
+        samples = nbinom.rvs(r, p, size=size)           
+            
+        return samples
     
     @staticmethod
     def pmf_range(params, upper_bound, lower_bound=0, design_matrix=None, mu=None, alpha=None):

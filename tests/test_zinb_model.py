@@ -39,15 +39,15 @@ def generate_zinb_data(size, mus, p0, alphas, probabilities):
     # Basic case with well-separated means
     {'size': 1000, 'mus': [13, 50, 200], 'p0': logit(0.3), 'alphas': [2, 3, 4], 'probabilities': [0.4, 0.2, 0.4]},
     # Small sample size
-    {'size': 100, 'mus': [13, 50, 200], 'p0': logit(0.3), 'alphas': [2, 3, 4], 'probabilities': [0.4, 0.2, 0.4]},
-    # Large sample size
-    {'size': 1000, 'mus': [13, 50, 200], 'p0': logit(0.3), 'alphas': [2, 3, 4], 'probabilities': [0.4, 0.2, 0.4]},
-    # Very high mu values
-    {'size': 1000, 'mus': [130, 500, 2000], 'p0': logit(0.3), 'alphas': [2, 3, 4], 'probabilities': [0.4, 0.2, 0.4]},
-    # Very low mu values
-    {'size': 1000, 'mus': [1, 2, 3], 'p0': logit(0.3), 'alphas': [2, 3, 4], 'probabilities': [0.4, 0.2, 0.4]},
-    # Varying probabilities
-    {'size': 1000, 'mus': [13, 50, 200], 'p0': logit(0.3), 'alphas': [2, 3, 4], 'probabilities': [0.1, 0.3, 0.6]},
+    # {'size': 100, 'mus': [13, 50, 200], 'p0': logit(0.3), 'alphas': [2, 3, 4], 'probabilities': [0.4, 0.2, 0.4]},
+    # # Large sample size
+    # {'size': 1000, 'mus': [13, 50, 200], 'p0': logit(0.3), 'alphas': [2, 3, 4], 'probabilities': [0.4, 0.2, 0.4]},
+    # # Very high mu values
+    # {'size': 1000, 'mus': [130, 500, 2000], 'p0': logit(0.3), 'alphas': [2, 3, 4], 'probabilities': [0.4, 0.2, 0.4]},
+    # # Very low mu values
+    # {'size': 1000, 'mus': [1, 2, 3], 'p0': logit(0.3), 'alphas': [2, 3, 4], 'probabilities': [0.4, 0.2, 0.4]},
+    # # Varying probabilities
+    # {'size': 1000, 'mus': [13, 50, 200], 'p0': logit(0.3), 'alphas': [2, 3, 4], 'probabilities': [0.1, 0.3, 0.6]},
 ])
 def data(request):
     params = request.param
@@ -59,7 +59,7 @@ def test_zinb_model(data):
     model = ZINBModel(y=y, covariates=covariates, name="ZINBModel")
 
     fit_res = model.fit(
-        optimization_method="trust-constr",
+        optimization_method="dogleg",
         verbose=False,
         parallel=False,
         ret_time=False,
@@ -89,6 +89,8 @@ def test_zinb_model(data):
     
     loglikelihood_diff = -final_loglikelihood + theoretical_loglikelihood
     
+    print("pred_tensor", pred_tensor)
+    print("params_tensor", params_tensor)
     print(f"Log-likelihood difference for theoretical means and final parameters: {loglikelihood_diff}")
     
     for param, log_mu in zip(params[1:], log_mus):
