@@ -35,7 +35,7 @@ pip install -e .
 
 ```python
 import numpy as np
-from glmpy import GLM
+from glmpy import ZINBModel
 
 # Generate some example data
 X = np.random.normal(size=(1000, 5))
@@ -44,8 +44,8 @@ linear_pred = X @ beta
 y = np.random.poisson(np.exp(linear_pred))
 
 # Fit Poisson regression with log link
-model = GLM(family="poisson", link="log")
-model.fit(X, y)
+model = ZINBModel(x = x, y = y)
+model.fit()
 
 # View model summary
 print(model.summary())
