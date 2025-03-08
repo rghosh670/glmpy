@@ -1,11 +1,3 @@
-# glmpy
-
-[![PyPI Version](https://img.shields.io/pypi/v/glmpy.svg)](https://pypi.python.org/pypi/glmpy)
-[![Build Status](https://img.shields.io/travis/rghosh670/glmpy.svg)](https://travis-ci.com/rghosh670/glmpy)
-[![Documentation Status](https://readthedocs.org/projects/glmpy/badge/?version=latest)](https://glmpy.readthedocs.io/en/latest/?version=latest)
-[![Python Versions](https://img.shields.io/pypi/pyversions/glmpy.svg)](https://pypi.org/project/glmpy/)
-[![License](https://img.shields.io/github/license/rghosh670/glmpy.svg)](https://github.com/rghosh670/glmpy/blob/main/LICENSE)
-
 ## Overview
 
 `glmpy` is a high-performance Python package for efficient modeling of Generalized Linear Models (GLMs). It provides a user-friendly interface for fitting, analyzing, and evaluating GLMs with a focus on speed and scalability for both small and large datasets.
